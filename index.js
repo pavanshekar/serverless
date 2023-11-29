@@ -8,9 +8,12 @@ const DOMAIN = process.env.MAILGUN_DOMAIN;
 const mg = mailgun({ apiKey: process.env.MAILGUN_API_KEY, domain: DOMAIN });
 
 exports.handler = async (event) => {
+    let userEmail, fileName = "Error-PreProcessing";
+
     try {
         const message = JSON.parse(event.Records[0].Sns.Message);
-        const { submissionUrl, userEmail } = message;
+        userEmail = message.userEmail;
+        const submissionUrl = message.submissionUrl;
 
         const response = await axios({
             method: 'GET',
@@ -23,31 +26,55 @@ exports.handler = async (event) => {
 
         const storage = new Storage({ credentials: parsedKey });
         const bucketName = process.env.GOOGLE_CLOUD_BUCKET;
-        const fileName = `github-release-${Date.now()}`;
+        fileName = `github-release-${Date.now()}`;
         const bucket = storage.bucket(bucketName);
         const file = bucket.file(fileName);
         await file.save(response.data);
 
-        const emailData = {
-            from: 'Download Status <downloads@demo.pavancloud.me>',
-            to: userEmail,
-            subject: 'GitHub Release Downloaded',
-            text: `Your requested GitHub release has been downloaded and stored in Google Cloud Storage. File Name: ${fileName}`
-        };
-        await mg.messages().send(emailData);
-
-        await dynamoDB.put({
-            TableName: process.env.DYNAMODB_TABLE_NAME,
-            Item: {
-                email: userEmail,
-                fileName: fileName,
-                status: 'Email Sent'
-            }
-        }).promise();
-
+        await sendSuccessEmail(userEmail, fileName);
+        await logToDynamoDB(userEmail, fileName, 'Email Sent');
         return { statusCode: 200, body: 'Process completed successfully.' };
     } catch (error) {
         console.error('Error processing event: ', error);
-        throw error;
+        await sendFailureEmail(userEmail, error.message);
+        await logToDynamoDB(userEmail, fileName, 'Failed', error.message);
+        return { statusCode: 500, body: 'Error processing request' };
     }
 };
+
+async function sendSuccessEmail(userEmail, fileName) {
+    const emailData = {
+        from: 'Download Status <downloads@demo.pavancloud.me>',
+        to: userEmail,
+        subject: 'GitHub Release Downloaded',
+        text: `Your requested GitHub release has been downloaded and stored in Google Cloud Storage. File Name: ${fileName}`
+    };
+    await mg.messages().send(emailData);
+}
+
+async function sendFailureEmail(userEmail, errorMessage) {
+    const emailData = {
+        from: 'Download Status <downloads@demo.pavancloud.me>',
+        to: userEmail,
+        subject: 'GitHub Release Download Failure',
+        text: `There was an error downloading your requested GitHub release: ${errorMessage}`
+    };
+    await mg.messages().send(emailData);
+}
+
+async function logToDynamoDB(userEmail, fileName, status, errorMessage = null) {
+    const item = {
+        email: userEmail,
+        fileName: fileName,
+        status: status
+    };
+
+    if (errorMessage) {
+        item.errorMessage = errorMessage;
+    }
+
+    await dynamoDB.put({
+        TableName: process.env.DYNAMODB_TABLE_NAME,
+        Item: item
+    }).promise();
+}
